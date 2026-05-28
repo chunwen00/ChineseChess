@@ -86,7 +86,7 @@ def screen_to_board(x: int, y: int) -> tuple[int, int] | None:
     if not (0 <= col <= 8 and 0 <= row <= 9):  # 若超出棋盤範圍就回傳 None
         return None  # 表示此次點擊不在棋盤上
 
-    # 檢查是否真的點在該落子點附近（距離太遠就視為無效點擊）
+    # 檢查是否真的點在該落子點附近（距離太遠就視為無效點擊）            
     px, py = board_to_screen(col, row)  # 取得該落子點的像素座標
     dist2 = (x - px) * (x - px) + (y - py) * (y - py)  # 計算與落子點的距離平方
     snap_radius = 36  # 允許吸附的半徑（要略大於棋子半徑）
@@ -94,6 +94,7 @@ def screen_to_board(x: int, y: int) -> tuple[int, int] | None:
         return None  # 不吸附，避免誤觸
 
     return col, row  # 回傳棋盤座標
+    
 
 
 def draw_board(screen: pygame.Surface, font: pygame.font.Font) -> None:
@@ -708,39 +709,80 @@ def load_cjk_font(size: int, bold: bool = False) -> pygame.font.Font:
     - 因此我們採用「先試 SysFont 多候選」→「再試直接載入字型檔」的策略。
     """
 
-    # 先用 SysFont 試常見字型族名（順序很重要：越常見/越可靠的放前面）
+    # 先定義一組「必須能顯示」的字元，用來避免選到缺字字型而出現方框/亂碼。
+    # 這些字涵蓋：楚河漢界 + 主要棋子字。
+    sample_chars = list("楚河漢界車馬炮象相士仕將帥卒兵")  # 用 metrics() 檢查是否有字形
+
+    def _supports_all(font: pygame.font.Font) -> bool:
+        """用 metrics() 檢查字型是否支援 sample_chars（缺字通常會回傳 None）。"""
+        try:
+            m = font.metrics("".join(sample_chars))
+            return m is not None and all(x is not None for x in m)
+        except Exception:
+            return False
+
+    def _load_font_file(path: str) -> pygame.font.Font | None:
+        """從字型檔載入並檢查字形覆蓋；若成功回傳 Font，否則回傳 None。"""
+        if not os.path.exists(path):
+            return None
+        try:
+            f = pygame.font.Font(path, size)
+            # pygame.font.Font(path, size) 不一定支援 bold 參數，這裡用 set_bold 來處理
+            f.set_bold(bool(bold))
+            return f if _supports_all(f) else None
+        except Exception:
+            return None
+
+    # 你想要「仿宋」：但你的 Windows 目前似乎沒有安裝仿宋（`simfang.ttf` / `fangsong.ttf` 不存在）。
+    # 因此我們提供「專案內字型檔」的支援：你若放入 fonts/FangSong.ttf（或 simfang.ttf），就會強制使用。
+    local_font_paths = [
+        os.path.join(os.path.dirname(__file__), "fonts", "FangSong.ttf"),
+        os.path.join(os.path.dirname(__file__), "fonts", "FANGSONG.TTF"),
+        os.path.join(os.path.dirname(__file__), "fonts", "simfang.ttf"),
+    ]
+    for p in local_font_paths:
+        f = _load_font_file(p)
+        if f is not None:
+            return f
+
+    # Windows 系統字型檔 fallback（若你之後安裝了仿宋字型，放在 C:\Windows\Fonts 也能被抓到）
+    win_font_paths = [
+        r"C:\Windows\Fonts\simfang.ttf",   # 仿宋（若已安裝）
+        r"C:\Windows\Fonts\fangsong.ttf",  # 仿宋（另一常見檔名）
+        r"C:\Windows\Fonts\FANGSONG.TTF",
+        # 其他完整中文 fallback（避免亂碼）
+        r"C:\Windows\Fonts\msjh.ttc",      # 微軟正黑體（繁中常見）
+        r"C:\Windows\Fonts\mingliu.ttc",   # 細明體
+        r"C:\Windows\Fonts\pmingliu.ttc",  # 新細明體
+        r"C:\Windows\Fonts\msyh.ttc",      # 微軟雅黑（簡中常見）
+        r"C:\Windows\Fonts\simhei.ttf",    # 黑體
+        r"C:\Windows\Fonts\simsun.ttc",    # 宋體
+    ]
+    for p in win_font_paths:
+        f = _load_font_file(p)
+        if f is not None:
+            return f
+
+    # 最後才用 SysFont（名稱解析在不同系統較不穩定）
     candidates = [
+        "FangSong",
+        "SimFang",
+        "STFangsong",
+        "仿宋",
         "Microsoft JhengHei",
+        "PMingLiU",
+        "MingLiU",
         "Microsoft YaHei",
         "SimHei",
         "SimSun",
-        "PMingLiU",
-        "MingLiU",
     ]
-
     for name in candidates:
-        f = pygame.font.SysFont(name, size, bold=bold)
         try:
-            if f.render("車", True, (0, 0, 0)).get_width() > 0:
+            f = pygame.font.SysFont(name, size, bold=bold)
+            if _supports_all(f):
                 return f
         except Exception:
             pass
-
-    win_font_paths = [
-        r"C:\Windows\Fonts\msjh.ttc",
-        r"C:\Windows\Fonts\msyh.ttc",
-        r"C:\Windows\Fonts\simhei.ttf",
-        r"C:\Windows\Fonts\simsun.ttc",
-        r"C:\Windows\Fonts\mingliu.ttc",
-        r"C:\Windows\Fonts\pmingliu.ttc",
-    ]
-
-    for path in win_font_paths:
-        if os.path.exists(path):
-            try:
-                return pygame.font.Font(path, size)
-            except Exception:
-                pass
 
     return pygame.font.Font(None, size)
 
@@ -800,8 +842,7 @@ def draw_scene(
 ) -> None:
     """繪製一整幀畫面並立刻更新到螢幕（用於 AI 思考前強制顯示狀態）。"""
     draw_board(screen, board_font)  # 棋盤
-    if dragging_from is not None:
-        draw_move_hints(screen, dragging_moves)  # 合法落點提示
+    # 依你的需求：移除「藍點/提示點」顯示，所以這裡不再畫合法落點提示
     draw_pieces(screen, pieces, piece_font)  # 盤面棋子
     if dragging_piece is not None:
         draw_single_piece_at_pixel(screen, dragging_piece, mouse_x, mouse_y, piece_font)  # 拖曳中的棋子
@@ -1044,6 +1085,11 @@ def main() -> None:
                 drop_pos = screen_to_board(mouse_x, mouse_y)  # 放開位置吸附到棋盤座標（可能為 None）
 
                 if drop_pos is not None and drop_pos in dragging_moves:
+                    # 先清空提示點（避免因事件處理順序造成提示殘留）
+                    dragging_from_old = dragging_from  # 暫存（若後面需要用到）
+                    dragging_from = None
+                    dragging_moves = set()
+
                     pieces[drop_pos] = dragging_piece
                     CURRENT_PIECES = pieces
                     cancel_ai_thinking()
