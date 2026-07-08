@@ -899,7 +899,10 @@ def main() -> None:
     human_side = "red"  # 玩家預設操作紅方
     ai_side = "black"  # AI 預設操作黑方
     current_turn = "red"  # 先手：紅方
-    ai_config = AIConfig(depth=2, use_tt=True, time_limit_sec=1.5)
+    # AI 強度調整：
+    # - depth 越大越強，但節點數呈指數成長會更慢
+    # - time_limit_sec 是「單步思考」時間上限；配合置換表/排序可在可接受時間內更強
+    ai_config = AIConfig(depth=3, use_tt=True, time_limit_sec=2.2)
 
     # --- 狀態列 / 勝負 / 悔棋 ---
     status_text = "輪到紅方（玩家）"
