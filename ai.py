@@ -19,9 +19,9 @@ Move = tuple[Pos, Pos]  # (from_pos, to_pos)
 
 @dataclass(frozen=True)
 class AIConfig:
-    depth: int = 3  # 預設搜尋深度 3 層（更強，但更慢；可搭配 time_limit_sec 調整）
+    depth: int = 4  # 預設搜尋深度 4 層（配合迭代加深 + TT，棋力明顯提升）
     use_tt: bool = True  # 是否啟用簡易置換表（快取）以加速
-    time_limit_sec: float = 2.2  # 單步思考時間上限（秒）；逾時回傳目前已算出的最佳走法
+    time_limit_sec: float = 3.5  # 單步思考時間上限（秒）；逾時回傳目前已算出的最佳走法
 
 
 @dataclass
@@ -486,14 +486,19 @@ def evaluate_position(
     評估項目：
     - 基礎分：車=90, 馬=40, 炮=45, 象=20, 士=20, 卒=10（將/帥給極大值）
     - 位置分（PST）：車馬炮兵士象將依落點加分/扣分
+    - 大子壓將：車/炮與敵將同列/同行加分（鼓勵控制與攻殺）
+    - 防守子力：己方士象尚在加分（鼓勵留士象保將）
     - 將帥受威脅（被將軍）加減分
     - 將帥對面：嚴重懲罰
     """
     score = 0
+    opp = "red" if ai_side == "black" else "black"
 
     # ----------------------------
-    # 1) 基礎分 + 位置分（PST）
+    # 1) 基礎分 + 位置分（PST）+ 防守子力
     # ----------------------------
+    advisors = {ai_side: 0, opp: 0}
+    elephants = {ai_side: 0, opp: 0}
     for (col, row), (side, name) in pieces.items():
         kind = normalize_kind(name)
         base = BASE_VALUE.get(kind, 0)
@@ -501,26 +506,58 @@ def evaluate_position(
         pst = position_bonus(side, kind, col, row)
         value = base + pst
         score += value if side == ai_side else -value
+        if kind == "士":
+            advisors[side] += 1
+        elif kind == "象":
+            elephants[side] += 1
+
+    # 士象齊全較安全：每位士/象約 +6（相對對手）
+    score += (advisors[ai_side] - advisors[opp]) * 6
+    score += (elephants[ai_side] - elephants[opp]) * 6
 
     # ----------------------------
-    # 2) 將帥受威脅扣分（被將軍）
+    # 2) 大子壓將（便宜且有效的攻勢啟發式）
     # ----------------------------
-    # 檢查 ai_side 的將帥是否被對手威脅；若是，扣分
+    # 若車/炮與敵將同直線，常形成將軍/抽將/牽制威脅 → 給小加分。
+    # 不做完整攻擊計算（避免評估函數太慢），只看行列對齊。
+    for side, sign in ((ai_side, 1), (opp, -1)):
+        king_pos = find_king_pos(pieces, "red" if side == "black" else "black")
+        if king_pos is None:
+            continue
+        kc, kr = king_pos
+        for (col, row), (s, name) in pieces.items():
+            if s != side:
+                continue
+            kind = normalize_kind(name)
+            if kind == "車":
+                if col == kc:
+                    score += 10 * sign
+                if row == kr:
+                    score += 8 * sign
+            elif kind == "炮":
+                if col == kc:
+                    score += 7 * sign
+                if row == kr:
+                    score += 6 * sign
+            elif kind == "馬":
+                # 馬靠近敵將九宮附近略加分（粗略距離）
+                dist = abs(col - kc) + abs(row - kr)
+                if dist <= 3:
+                    score += 3 * sign
+
+    # ----------------------------
+    # 3) 將帥受威脅扣分（被將軍）
+    # ----------------------------
+    # 加大權重：寧可先解將/造將，也不要貪子漏殺
     if is_in_check(pieces, ai_side, get_valid_moves_func):
-        score -= 80  # 將帥受威脅扣分（可依需要調整）
-    # 檢查對手將帥是否被威脅；若是，加分
-    opp = "red" if ai_side == "black" else "black"
+        score -= 160
     if is_in_check(pieces, opp, get_valid_moves_func):
-        score += 80
+        score += 140
 
     # ----------------------------
-    # 3) 將帥對面：視為嚴重非法（大幅扣分/加分）
+    # 4) 將帥對面：視為嚴重非法（大幅扣分）
     # ----------------------------
-    # 正常走子已避免對面，但在搜尋過程仍可能因為外部函式差異而出現，
-    # 這裡保守處理：如果對面，對當前盤面給極端懲罰。
     if kings_facing_func(pieces):
-        # 若出現對面，視為對「剛走子的一方」不利，但我們不易判斷剛走子方，
-        # 所以採用中性但極端：直接把評估壓到很差（搜尋會自然避開）。
         score -= 2_000
 
     return score
@@ -600,14 +637,16 @@ def choose_best_move(
     """
     用 Minimax + Alpha-Beta 剪枝選出 ai_side 最佳一步。
 
+    強化點：迭代加深（Iterative Deepening）
+    - 由淺到深：depth=1 → 2 → ... → config.depth
+    - 每一層完整算完才採用該層最佳走法（逾時則保留上一層結果，避免半成品分數誤導）
+    - 上一層的走法分數用來重排下一層根節點走法順序 → 剪枝更兇、更深更快
+
     Alpha-Beta 剪枝如何減少運算量（中文說明）：
     - 在 Minimax 中，MAX 節點要找「子節點中最大的分數」，MIN 節點要找「最小的分數」。
     - Alpha 表示「目前 MAX 已知的最佳(最大)下界」，Beta 表示「目前 MIN 已知的最佳(最小)上界」。
-    - 當在搜尋某分支時發現 alpha >= beta，代表：
-      - MAX 已經有一條路保證至少 alpha 分；
-      - 但 MIN 在當前分支已能讓結果最多只有 beta 分；
-      - 如果 alpha >= beta，這個分支不可能讓雙方選擇改變最終決策，
-        因此可以「直接停止」繼續展開子節點（剪枝），大幅減少需要評估的局面數量。
+    - 當在搜尋某分支時發現 alpha >= beta，代表這個分支不可能改變最終決策，
+      因此可以「直接停止」繼續展開子節點（剪枝）。
     """
     if config is None:
         config = AIConfig()
@@ -617,14 +656,10 @@ def choose_best_move(
         return None
 
     best_move: Move | None = None
-    best_score = -10**18
     # 置換表（Transposition Table）：用 zobrist_key 當 key（O(1)），條目含 depth + 界限旗標
     transposition_table: dict[int, TTEntry] = {}
     hasher = ZobristHasher()  # 初始化 Zobrist 隨機表（10x9x14）與 side_to_move_key
-    # 歷史啟發表（History Heuristic）：
-    # - history_table[from_index][to_index] 記錄「非吃子」普通走法的歷史得分
-    # - 90 = 9x10 個落子點；index = row*9 + col
-    # - 初始皆為 0
+    # 歷史啟發表（History Heuristic）：跨迭代加深層共用，越搜越好用
     history_table: list[list[int]] = [[0 for _ in range(90)] for _ in range(90)]
     budget = SearchBudget.from_limit(config.time_limit_sec)  # 建立本步時間預算
 
@@ -635,43 +670,79 @@ def choose_best_move(
     # 初始化全盤 zobrist_key（僅在根節點做一次；後續靠 make/unmake_move XOR 動態更新）
     root_key = hasher.compute_key(pieces, side_to_play=ai_side)
 
-    # 根節點：AI 是 MAX 端（每評估完一個根走法就檢查是否逾時）
-    for mv in root_moves:
-        if budget.expired():  # 時間到：不再展開新分支，直接回傳目前已知的最佳走法
+    max_depth = max(1, config.depth)
+    for depth in range(1, max_depth + 1):
+        if budget.expired():
             break
-        # 用 make/unmake_move 代替 apply_move（避免每節點複製 dict；並同步更新 zobrist_key）
-        captured, child_key = make_move(pieces, mv, zobrist_key=root_key, hasher=hasher)
-        s = minimax(
-            pieces=pieces,
-            depth=config.depth - 1,
-            maximizing=False,
-            ai_side=ai_side,
-            alpha=-10**18,
-            beta=10**18,
-            get_valid_moves_func=get_valid_moves_func,
-            kings_facing_func=kings_facing_func,
-            transposition_table=transposition_table,
-            hasher=hasher,
-            zobrist_key=child_key,
-            history_table=history_table,
-            use_tt=config.use_tt,
-            budget=budget,
-        )
-        root_key = unmake_move(
-            pieces,
-            mv,
-            captured=captured,
-            zobrist_key=child_key,
-            hasher=hasher,
-        )
-        if s > best_score:
-            best_score = s
-            best_move = mv
 
-    # 若時間太短來不及算任何分數，至少走第一步合法棋（避免 None 卡住）
+        iteration_best: Move | None = None
+        iteration_score = -10**18
+        scored: list[tuple[int, Move]] = []
+        incomplete = False
+
+        for mv in root_moves:
+            if budget.expired():
+                incomplete = True
+                break
+            captured, child_key = make_move(pieces, mv, zobrist_key=root_key, hasher=hasher)
+            s = minimax(
+                pieces=pieces,
+                depth=depth - 1,
+                maximizing=False,
+                ai_side=ai_side,
+                alpha=-10**18,
+                beta=10**18,
+                get_valid_moves_func=get_valid_moves_func,
+                kings_facing_func=kings_facing_func,
+                transposition_table=transposition_table,
+                hasher=hasher,
+                zobrist_key=child_key,
+                history_table=history_table,
+                use_tt=config.use_tt,
+                budget=budget,
+            )
+            root_key = unmake_move(
+                pieces,
+                mv,
+                captured=captured,
+                zobrist_key=child_key,
+                hasher=hasher,
+            )
+            scored.append((s, mv))
+            if s > iteration_score:
+                iteration_score = s
+                iteration_best = mv
+
+        # 只有「完整層」才更新正式最佳走法（逾時半層不採用，避免誤判）
+        if not incomplete and iteration_best is not None:
+            best_move = iteration_best
+            # 依本層分數重排根走法：下一層先搜好棋 → Alpha-Beta 剪得更多
+            scored.sort(key=lambda x: x[0], reverse=True)
+            root_moves = [mv for _, mv in scored]
+        elif best_move is None and iteration_best is not None:
+            # 連第一層都沒完整算完：至少先用目前最好的
+            best_move = iteration_best
+
+        if budget.expired():
+            break
+
     if best_move is None:
         best_move = root_moves[0]
     return best_move
+
+
+def _child_search_depth(depth: int, gives_check: bool) -> int:
+    """
+    計算子節點剩餘深度，並在「將軍」時做延伸（Check Extension）。
+
+    - 正常：depth - 1
+    - 若此步造成將軍：多看 1 層（回傳 depth），避免漏掉連將/殺棋
+    - 限制：只在 depth <= 4 時延伸，防止將軍延伸無限膨脹
+    """
+    next_depth = depth - 1
+    if gives_check and depth <= 4:
+        next_depth = depth  # 等於 depth-1+1
+    return next_depth
 
 
 def minimax(
@@ -884,9 +955,13 @@ def minimax(
             _src, _dst = mv
             is_capture = (_dst in pieces and pieces[_dst][0] != side_to_play)
             captured, child_key = make_move(pieces, mv, zobrist_key=zobrist_key, hasher=hasher)
+            # 將軍延伸：走完後若對手被將軍，多搜一層
+            opp = "red" if side_to_play == "black" else "black"
+            gives_check = is_in_check(pieces, opp, get_valid_moves_func)
+            child_depth = _child_search_depth(depth, gives_check)
             child_score = minimax(
                 pieces,
-                depth - 1,
+                child_depth,
                 False,
                 ai_side,
                 alpha,
@@ -926,7 +1001,7 @@ def minimax(
                         return r * 9 + c
 
                     f, t = mv
-                    history_table[_idx(f)][_idx(t)] += 1 << depth  # 2^depth
+                    history_table[_idx(f)][_idx(t)] += 1 << max(0, depth)  # 2^depth
                 break  # Beta 剪枝：MIN 已有更好上界，MAX 再搜也不會改變選擇
         # TT 回填
         if use_tt and transposition_table is not None:
@@ -946,9 +1021,12 @@ def minimax(
             break
         assert hasher is not None
         captured, child_key = make_move(pieces, mv, zobrist_key=zobrist_key, hasher=hasher)
+        opp = "red" if side_to_play == "black" else "black"
+        gives_check = is_in_check(pieces, opp, get_valid_moves_func)
+        child_depth = _child_search_depth(depth, gives_check)
         child_score = minimax(
             pieces,
-            depth - 1,
+            child_depth,
             True,
             ai_side,
             alpha,
